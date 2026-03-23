@@ -111,7 +111,12 @@ def write_paper(filename, title, content):
     if not filename.endswith(".tex"):
         filename += ".tex"
         
-    filepath = os.path.join(os.getcwd(), filename)
+    results_dir = os.path.join(os.getcwd(), "results")
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+        
+    filename = os.path.basename(filename)
+    filepath = os.path.join(results_dir, filename)
     latex_template = f"\\documentclass{{article}}\n\\usepackage[utf8]{{inputenc}}\n\\usepackage{{amsmath}}\n\\usepackage{{amssymb}}\n\\title{{{title}}}\n\\author{{Autonomous AI Physicist}}\n\\begin{{document}}\n\\maketitle\n\n{content}\n\n\\end{{document}}\n"
     
     try:

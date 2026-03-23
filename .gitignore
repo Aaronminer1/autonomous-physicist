@@ -12,3 +12,4 @@ __pycache__/
 
 # Ignore testing script
 elastic_demo_3d.py
+results/
