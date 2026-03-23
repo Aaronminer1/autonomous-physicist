@@ -5,7 +5,7 @@ import json
 import sys
 import time
 import re
-from laboratory import execute_math_code, search_arxiv, write_paper, world_build, world_step, world_read, world_set_velocity, world_record
+from laboratory import LaboratoryBuilder, execute_math_code, search_arxiv, write_paper, world_build, world_step, world_read, world_set_velocity, world_record, plot_telemetry, save_dataset, load_dataset, get_mass_properties, chalkboard_write, chalkboard_read, sympy_derive, read_manual
 
 # Proxy standard print to broadcast to the new Web Dashboard
 _builtin_print = print
@@ -38,13 +38,43 @@ You are an autonomous AI theoretical physicist. You MUST STRICTLY follow the Sci
 2. Self-Reflection: Before writing any code or thesis, ALWAYS ask yourself qualifying "What If" and "If Then" questions. Critique your own approach to find flaws before proceeding.
 3. Hypothesis: Formulate your mathematical hypothesis based on your literature review and critical self-reflection.
 4. Experiment & Proof: You MUST use `execute_math_code` to run mathematical proofs using Python tools like `sympy` or `scipy`.
-5. Empirical World Interaction: You are given access to a persistent 3D physical world hosted autonomously. 
-   - First, use `world_build` to spawn the necessary physical objects using standard MuJoCo XML string formats. CRITICAL: If you want an object (like a sphere) to be affected by physics and gravity, you MUST include `<freejoint/>` inside its `<body ...>` tag! Otherwise, it will be a frozen statue!
-   - Second, use `world_set_velocity` to physically push the bodies and give them initial momentum.
-   - Third, use `world_record` to record a continuous array of telemetry (like a high-speed camera). Use this instead of `world_read` if you are expecting fast dynamic kinematics to occur over the next few seconds (e.g., dropping or bouncing).
-   Do NOT write your own math scripts to derive kinematic result vectors—the persistent physics engine natively handles true gravity, friction, and collision for you seamlessly!
-6. Analysis: Analyze the high-speed laboratory results recursively.
-7. Publication: ONLY after you have mathematical results, use `write_paper` to write your final formal LaTeX document summarising your findings.
+5. Empirical World Interaction: You are given access to a persistent 3D physical world. 
+    - Build: Use `construct_laboratory` to write Python code that builds your world using the `LaboratoryBuilder` class.
+    Capabilities: 
+    - `add_sphere(name, pos, radius, material)`
+    - `add_box(name, pos, size, material)`
+    - `add_joint(parent_body, name, type="hinge", axis="0 1 0")`
+    - `add_site(parent_body, name, pos)` (Required for tendons)
+    - `add_tendon(site1, site2, name, stiffness)` (Cable/String physics)
+    - `add_equality_constraint(body1, body2)` (Welding/Closed loops)
+    - `add_actuator(joint_name, gear=1)`
+    - `set_environment(gravity="0 0 -9.81", viscosity="0.01")`
+    - Manipulation: Use `world_set_velocity` and `world_apply_force`.
+    - Instrumentation: Use `world_read`, `world_get_sensors`, and `world_get_contacts`.
+    - Professional Rigor: ALWAYS use `get_mass_properties` to audit your world after building.
+    - Persistence: Use `save_dataset(name, data)` to permanently commit results.
+    - **Digital Chalkboard & Fluidity**: 
+        - AT THE START of every mission, use `chalkboard_read()` to retrieve prior constants, derivations, and hypotheses.
+        - Use `sympy_derive(expr)` for symbolic proofs; results are auto-saved to the chalkboard.
+        - Use `chalkboard_write(heading, content)` to save physical constants ($g, m, \text{etc.}$) for your future self.
+    - **Self-Correction & Troubleshooting**: 
+        - If you encounter a `[Builder Error]` or MuJoCo crash, YOU MUST use `read_manual()` to look up the specific schema rule or stability fix before retrying.
+    - Visualization: Use `plot_telemetry(history_data, filename="plot.png", title="Chart Title")`.
+    Example of a Cable-Stayed Crane:
+    ```python
+    lab = LaboratoryBuilder()
+    # 1. Define Bodies FIRST
+    tower = lab.add_box("tower", pos=[0,0,1], size=[0.1, 0.1, 1], dynamic=False)
+    mass = lab.add_sphere("mass", pos=[1,0,2], radius=0.1)
+    # 2. Add Sites/Joints to those bodies (NEVER add sites/joints to the 'world' directly)
+    lab.add_site(tower, "anchor", pos="0 0 1")
+    lab.add_site(mass, "hook", pos="0 0 0")
+    # 3. Connect them with a Tendon
+    lab.add_tendon(site1="anchor", site2="hook", name="cable", stiffness="1000")
+    print(lab.get_xml())
+    ```
+6. Analysis: Perform comparative analysis if historical data exists. Analyze high-fidelity results.
+7. Publication: Use `write_paper` for the formal LaTeX document. Cite your chalkboard derivations and saved datasets.
 
 # Termination
 After you have successfully written your paper using the `write_paper` tool, you must output the phrase:
@@ -76,14 +106,14 @@ def chat_with_llm(messages, arxiv_uses=0):
             {
                 "type": "function",
                 "function": {
-                    "name": "world_build",
-                    "description": "Completely builds the Persistent Physics World using an XML string. This replaces any existing world.",
+                    "name": "construct_laboratory",
+                    "description": "Writes Python code to build a MuJoCo world using LaboratoryBuilder. Replaces any existing world.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "xml_string": {"type": "string", "description": "The exact full MuJoCo XML (<mujoco>...</mujoco>) modeling the environment and bodies."}
+                            "code": {"type": "string", "description": "Python string using lab = LaboratoryBuilder(). Must be self-contained."}
                         },
-                        "required": ["xml_string"]
+                        "required": ["code"]
                     }
                 }
             },
@@ -130,12 +160,50 @@ def chat_with_llm(messages, arxiv_uses=0):
             {
                 "type": "function",
                 "function": {
-                    "name": "world_record",
-                    "description": "Records continuous positional telemetry for all objects over a specified duration (in seconds). Use this to watch fast physics events like falling or bouncing in high resolution.",
+                    "name": "world_apply_force",
+                    "description": "Applies a continuous 3D force and/or torque vector to a body. Force persists until changed.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "duration": {"type": "number", "description": "How many seconds of real-time to record. Maximum 10."}
+                            "body_name": {"type": "string", "description": "The exact name attribute of the MuJoCo body."},
+                            "force_vector": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] force in Newtons."},
+                            "torque_vector": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] torque."}
+                        },
+                        "required": ["body_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "world_get_sensors",
+                    "description": "Reads all active sensors (accelerometers, gyros, force-torque) defined in the XML.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "world_get_contacts",
+                    "description": "Returns detailed collision interaction data (normals, impact forces, penetration) for all current contacts.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "world_record",
+                    "description": "Records high-resolution positional and rotational telemetry for all objects over a duration.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "duration": {"type": "number", "description": "Seconds to record. Max 10."}
                         },
                         "required": ["duration"]
                     }
@@ -169,6 +237,113 @@ def chat_with_llm(messages, arxiv_uses=0):
                             "content": {"type": "string", "description": "The formatted content of the paper in pure LaTeX. DO NOT include \\documentclass or \\begin{document}, it is automatically wrapped for you."}
                         },
                         "required": ["filename", "title", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "plot_telemetry",
+                    "description": "Generates a PNG graph from world_record history data.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "history_data": {"type": "string", "description": "The raw JSON string returned by world_record()."},
+                            "filename": {"type": "string", "description": "The .png filename to save in the results directory."},
+                            "title": {"type": "string", "description": "Title of the plot."}
+                        },
+                        "required": ["history_data", "filename"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "save_dataset",
+                    "description": "Formally saves simulation data to a persistent CSV for future comparison.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Filename, e.g., 'impact_test_v1.csv'."},
+                            "data": {"type": "string", "description": "The raw JSON string from world_record()."}
+                        },
+                        "required": ["name", "data"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "load_dataset",
+                    "description": "Loads a historical CSV dataset for comparative analysis.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "The .csv filename."}
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_mass_properties",
+                    "description": "Audits the world to return total system mass, center of mass, and individual body masses.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "chalkboard_write",
+                    "description": "Appends a technical note or derivation to the persistent scientific chalkboard.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string", "description": "E.g., 'Centrifugal Force Derivation'."},
+                            "content": {"type": "string", "description": "The technical content or LaTeX proof."}
+                        },
+                        "required": ["heading", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "chalkboard_read",
+                    "description": "Reads the persistent scientific chalkboard to retrieve prior knowledge.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sympy_derive",
+                    "description": "Performs symbolic math (simplify, diff, integrate) and auto-saves to the chalkboard.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string", "description": "The sympy expression, e.g., 'diff(cos(x), x)'."}
+                        },
+                        "required": ["expression"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_manual",
+                    "description": "Reads the Laboratory Manual for MJCF schema rules and troubleshooting tips.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
                     }
                 }
             }
@@ -220,15 +395,27 @@ def run_research_loop(topic):
                 
                 print(f"\n\033[1;35m[Executing Native Tool]: {func_name}\033[0m")
                 
-                if func_name == "execute_math_code":
+                if func_name == "construct_laboratory":
+                    code_block = args.get("code", "")
+                    try:
+                        # Prepare namespace with needed class
+                        loc = {"LaboratoryBuilder": LaboratoryBuilder}
+                        exec(code_block, loc)
+                        if "lab" in loc:
+                            xml_output = loc["lab"].get_xml()
+                            output = world_build(xml_output)
+                            print(output.strip())
+                        else:
+                            output = "[Error]: construct_laboratory code must define 'lab = LaboratoryBuilder()'."
+                            print(output)
+                    except Exception as e:
+                        output = f"[Builder Error]: {str(e)}"
+                        print(output)
+                    
+                elif func_name == "execute_math_code":
                     code_string = args.get("code_string", "")
                     output = execute_math_code(code_string)
                     print(output.strip()[:500] + ("..." if len(output) > 500 else ""))
-                    
-                elif func_name == "world_build":
-                    xml_string = args.get("xml_string", "")
-                    output = world_build(xml_string)
-                    print(output.strip()[:500])
                     
                 elif func_name == "world_step":
                     count = args.get("count", 1)
@@ -244,6 +431,21 @@ def run_research_loop(topic):
                     velocity_vector = args.get("velocity_vector", [0,0,0])
                     output = world_set_velocity(body_name, velocity_vector)
                     print(output.strip()[:500])
+
+                elif func_name == "world_apply_force":
+                    body_name = args.get("body_name", "")
+                    force_vector = args.get("force_vector", [0,0,0])
+                    torque_vector = args.get("torque_vector", [0,0,0])
+                    output = world_apply_force(body_name, force_vector, torque_vector)
+                    print(output.strip()[:500])
+
+                elif func_name == "world_get_sensors":
+                    output = world_get_sensors()
+                    print(f"Retrieved {len(output)} bytes of sensor data.")
+
+                elif func_name == "world_get_contacts":
+                    output = world_get_contacts()
+                    print(f"Retrieved {len(output)} bytes of contact telemetry.")
                     
                 elif func_name == "world_record":
                     duration = args.get("duration", 1.0)
@@ -265,6 +467,47 @@ def run_research_loop(topic):
                     text_content = args.get("content", "")
                     output = write_paper(filename, title, text_content)
                     print(output)
+                    
+                elif func_name == "plot_telemetry":
+                    history_data = args.get("history_data", "")
+                    filename = args.get("filename", "plot.png")
+                    title = args.get("title", "Simulation Data")
+                    output = plot_telemetry(history_data, filename, title)
+                    print(output)
+                    
+                elif func_name == "save_dataset":
+                    name = args.get("name", "data.csv")
+                    data = args.get("data", "")
+                    output = save_dataset(name, data)
+                    print(output)
+                    
+                elif func_name == "load_dataset":
+                    name = args.get("name", "")
+                    output = load_dataset(name)
+                    print(f"Loaded {len(output)} bytes of historical data.")
+                    
+                elif func_name == "get_mass_properties":
+                    output = get_mass_properties()
+                    print(output[:500])
+                    
+                elif func_name == "chalkboard_write":
+                    h = args.get("heading", "Note")
+                    c = args.get("content", "")
+                    output = chalkboard_write(h, c)
+                    print(output)
+                    
+                elif func_name == "chalkboard_read":
+                    output = chalkboard_read()
+                    print(f"Read from Chalkboard:\n{output[:500]}...")
+                    
+                elif func_name == "sympy_derive":
+                    expr = args.get("expression", "")
+                    output = sympy_derive(expr)
+                    print(output)
+                    
+                elif func_name == "read_manual":
+                    output = read_manual()
+                    print(f"Read from Laboratory Manual:\n{output[:1000]}...")
                 else:
                     output = f"[Error]: Tool {func_name} not recognized."
                 

@@ -3,7 +3,15 @@ from PIL import Image
 import io
 import time
 import threading
+import os
+import signal
+import atexit
+import subprocess
+import sys
 from flask import Flask, request, jsonify, Response, render_template_string
+
+# Force EGL for GPU accelerated rendering
+os.environ["MUJOCO_GL"] = "egl"
 
 app = Flask(__name__)
 
@@ -14,10 +22,14 @@ lock = threading.Lock()
 condition = threading.Condition()
 ai_logs = []
 active_researcher = None
+researcher_status = "STOPPED" # STOPPED, RUNNING, PAUSED
+
+# Initialize latest_frame with a placeholder (Black 1x1 JPEG)
+latest_frame = b'\xff\xd8\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x08\x01\x01\x00\x00\x01\x05\x02\xbf\xff\xd9'
 
 default_xml = """<mujoco>
   <compiler angle="degree"/>
-  <option gravity="0 0 -9.81" timestep="0.01"/>
+  <option gravity="0 0 -9.81" timestep="0.002" integrator="RK4"/>
   <visual>
     <global offwidth="640" offheight="480"/>
   </visual>
@@ -28,49 +40,95 @@ default_xml = """<mujoco>
 </mujoco>"""
 
 def physics_loop():
-    global m, d, latest_frame
-    
-    try:
-        local_m = mujoco.MjModel.from_xml_string(default_xml)
-        local_d = mujoco.MjData(local_m)
-        with lock:
-            m = local_m
-            d = local_d
-        renderer = mujoco.Renderer(local_m, 480, 640)
-    except Exception as e:
-        print("Renderer init error:", e)
-        return
-
-    last_update = time.time()
+    global m, d
+    last_p_time = time.time()
     while True:
+        # Get local copies of m and d to reduce lock holding time
+        local_m = None
+        local_d = None
         with lock:
-            if m is not None and d is not None:
-                if renderer.model != m:
-                    renderer.close()
-                    renderer = mujoco.Renderer(m, 480, 640)
-                    last_update = time.time()
-                
-                now = time.time()
-                dt = now - last_update
-                last_update = now
-                
-                steps = int(dt / m.opt.timestep)
-                for _ in range(steps):
-                    mujoco.mj_step(m, d)
-                
-                try:
-                    renderer.update_scene(d)
-                    pixels = renderer.render()
-                    img = Image.fromarray(pixels)
-                    buf = io.BytesIO()
-                    img.save(buf, format='JPEG')
+            local_m = m
+            local_d = d
+            
+        if local_m is not None and local_d is not None:
+            now = time.time()
+            dt = now - last_p_time
+            last_p_time = now
+            
+            # Catch up physics steps to real time in small batches to avoid blocking APIs
+            num_steps = int(dt / local_m.opt.timestep)
+            # Max catchup to avoid death spiral
+            num_steps = min(num_steps, 100) 
+            
+            # Step in batches of 10 to allow lock interleaving
+            batch_size = 10
+            for i in range(0, num_steps, batch_size):
+                with lock:
+                    for _ in range(min(batch_size, num_steps - i)):
+                        mujoco.mj_step(local_m, local_d)
+                time.sleep(0.0001) # Shortest yield
                     
+        time.sleep(0.001)
+                    
+        time.sleep(0.001)
+
+def rendering_loop():
+    global m, d, latest_frame
+    renderer = None
+    last_m = None
+    last_error_msg = ""
+    while True:
+        local_m = None
+        local_d = None
+        with lock:
+            local_m = m
+            local_d = d
+        
+        if local_m is not None and local_d is not None:
+            try:
+                # Initialize renderer outside the lock
+                if renderer is None or local_m != last_m:
+                    if renderer: renderer.close()
+                    renderer = mujoco.Renderer(local_m, 480, 640)
+                    last_m = local_m
+                    print(f"[Server]: MJRenderer initialized (GL: {os.environ.get('MUJOCO_GL')})")
+                
+                # Render using a quick look at the data
+                with lock:
+                    renderer.update_scene(local_d)
+                
+                pixels = renderer.render()
+                img = Image.fromarray(pixels)
+                buf = io.BytesIO()
+                # Lower quality to 70 for speed and lower bandwidth
+                img.save(buf, format='JPEG', quality=70)
+                new_frame = buf.getvalue()
+                
+                with condition:
+                    latest_frame = new_frame
+                    condition.notify_all()
+                last_error_msg = ""
+            except Exception as e:
+                err_str = str(e)
+                if err_str != last_error_msg:
+                    print(f"[Renderer Error]: {err_str}", file=sys.stderr)
+                    last_error_msg = err_str
+                
+                # Create a red 'ERROR' frame for visual feedback (outside lock)
+                try:
+                    from PIL import ImageDraw
+                    err_img = Image.new('RGB', (640, 480), color=(50, 0, 0))
+                    draw = ImageDraw.Draw(err_img)
+                    draw.text((10, 10), f"MUJOCO RENDER ERROR:\n{err_str}", fill=(255, 255, 255))
+                    buf = io.BytesIO()
+                    err_img.save(buf, format='JPEG')
                     with condition:
                         latest_frame = buf.getvalue()
                         condition.notify_all()
-                except Exception as e:
+                except:
                     pass
-        time.sleep(1/30.0)
+                time.sleep(1.0)
+        time.sleep(1/45.0) # Aim for ~45 FPS internally to saturate 30 FPS MJPEG
 
 @app.route('/build_world', methods=['POST'])
 def build_world():
@@ -119,13 +177,71 @@ def read():
     with lock:
         if m is None:
             return jsonify({"error": "World not built"}), 400
-        positions = []
+        bodies = []
         for i in range(m.nbody):
             name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i)
             if name != "world":
                 pos = d.xpos[i].tolist()
-                positions.append({"name": name, "position": pos})
-        return jsonify({"time": d.time, "bodies": positions})
+                quat = d.xquat[i].tolist() # [w, x, y, z]
+                vel = d.cvel[i].tolist() # [rot_x, rot_y, rot_z, lin_x, lin_y, lin_z]
+                bodies.append({
+                    "name": name, 
+                    "position": pos, 
+                    "quaternion": quat,
+                    "velocity_angular": vel[:3],
+                    "velocity_linear": vel[3:]
+                })
+        return jsonify({"time": d.time, "bodies": bodies})
+
+@app.route('/force', methods=['POST'])
+def apply_force():
+    global m, d
+    body_name = request.json.get("body_name")
+    force = request.json.get("force", [0, 0, 0])
+    torque = request.json.get("torque", [0, 0, 0])
+    with lock:
+        if m is None: return jsonify({"error": "World not built"}), 400
+        try:
+            body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id == -1: return jsonify({"error": f"Body '{body_name}' not found"}), 400
+            d.xfrc_applied[body_id, :3] = force
+            d.xfrc_applied[body_id, 3:] = torque
+            return jsonify({"status": f"Applied force {force} and torque {torque} to '{body_name}'."})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+@app.route('/sensors', methods=['GET'])
+def get_sensors():
+    global m, d
+    with lock:
+        if m is None: return jsonify({"error": "World not built"}), 400
+        sensor_data = {}
+        for i in range(m.nsensor):
+            name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_SENSOR, i)
+            adr = m.sensor_adr[i]
+            dim = m.sensor_dim[i]
+            data = d.sensordata[adr:adr+dim].tolist()
+            sensor_data[name or f"sensor_{i}"] = data
+        return jsonify({"sensors": sensor_data})
+
+@app.route('/contacts', methods=['GET'])
+def get_contacts():
+    global m, d
+    with lock:
+        if m is None: return jsonify({"error": "World not built"}), 400
+        contacts = []
+        for i in range(d.ncon):
+            con = d.contact[i]
+            geom1 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, con.geom1)
+            geom2 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, con.geom2)
+            contacts.append({
+                "geom1": geom1,
+                "geom2": geom2,
+                "position": con.pos.tolist(),
+                "normal": con.frame[:3].tolist(),
+                "distance": float(con.dist)
+            })
+        return jsonify({"contact_count": d.ncon, "contacts": contacts})
 
 @app.route('/record', methods=['POST'])
 def record():
@@ -155,13 +271,51 @@ def record():
         
     return jsonify({"history": history, "duration": duration})
 
+@app.route('/mass', methods=['GET'])
+def get_mass():
+    global m, d
+    with lock:
+        if m is None: return jsonify({"error": "World not built"}), 400
+        
+        total_mass = 0
+        com = [0, 0, 0]
+        body_data = []
+        
+        for i in range(m.nbody):
+            name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i)
+            mass = float(m.body_mass[i])
+            ipos = d.xpos[i].tolist() # Using xpos as a proxy for world COM of the body
+            
+            if name != "world":
+                total_mass += mass
+                com[0] += mass * ipos[0]
+                com[1] += mass * ipos[1]
+                com[2] += mass * ipos[2]
+            
+            body_data.append({"name": name, "mass": mass, "position": ipos})
+            
+        if total_mass > 0:
+            com = [c / total_mass for c in com]
+            
+        return jsonify({
+            "total_mass": total_mass,
+            "center_of_mass": com,
+            "bodies": body_data
+        })
+
 def generate_frames():
     while True:
         with condition:
-            condition.wait()
+            if not condition.wait(timeout=1.0):
+                # If no frame for 1s, just yield whatever we have
+                pass
             frame = latest_frame
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        else:
+            time.sleep(0.1)
 
 @app.route('/video_feed')
 def video_feed():
@@ -182,6 +336,7 @@ def api_models():
 def api_start():
     global active_researcher, ai_logs
     import subprocess
+    import os
     
     data = request.json
     model = data.get("model", "nemotron-3-super:cloud")
@@ -189,7 +344,8 @@ def api_start():
 
     if active_researcher is not None:
         try:
-            active_researcher.terminate()
+            import signal
+            os.killpg(os.getpgid(active_researcher.pid), signal.SIGKILL)
             active_researcher.wait(timeout=2)
         except:
             pass
@@ -199,19 +355,87 @@ def api_start():
     if topic:
         cmd.extend(["--topic", topic])
         
-    active_researcher = subprocess.Popen(cmd)
-    return jsonify({"status": "started"})
+    import sys
+    active_researcher = subprocess.Popen(cmd, preexec_fn=os.setsid, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    researcher_status = "RUNNING"
+    
+    def monitor_researcher():
+        global researcher_status
+        for line in iter(active_researcher.stdout.readline, b''):
+            msg = line.decode('utf-8').strip()
+            if msg:
+                ai_logs.append(msg)
+                if len(ai_logs) > 500: ai_logs.pop(0)
+        researcher_status = "STOPPED"
+        
+    threading.Thread(target=monitor_researcher, daemon=True).start()
+    
+    print(f"[Server]: Spawned researcher PID {active_researcher.pid}")
+    return jsonify({"status": "started", "state": researcher_status})
+
+@app.route('/api/pause', methods=['POST'])
+def api_pause():
+    global active_researcher, researcher_status, ai_logs
+    if active_researcher is not None and researcher_status == "RUNNING":
+        try:
+            os.killpg(os.getpgid(active_researcher.pid), signal.SIGSTOP)
+            researcher_status = "PAUSED"
+            ai_logs.append("[System]: AI Researcher SUSPENDED (Paused).")
+            return jsonify({"status": "paused", "state": researcher_status})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "No running researcher to pause"}), 400
+
+@app.route('/api/resume', methods=['POST'])
+def api_resume():
+    global active_researcher, researcher_status, ai_logs
+    if active_researcher is not None and researcher_status == "PAUSED":
+        try:
+            os.killpg(os.getpgid(active_researcher.pid), signal.SIGCONT)
+            researcher_status = "RUNNING"
+            ai_logs.append("[System]: AI Researcher RESUMED.")
+            return jsonify({"status": "resumed", "state": researcher_status})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "No paused researcher to resume"}), 400
     
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
-    global active_researcher
+    global active_researcher, ai_logs, researcher_status
     if active_researcher is not None:
         try:
-            active_researcher.terminate()
-        except:
-            pass
+            os.killpg(os.getpgid(active_researcher.pid), signal.SIGKILL)
+            ai_logs.append("[System]: AI Researcher STOPPED.")
+        except Exception as e:
+            ai_logs.append(f"[System]: Failed to stop: {e}")
         active_researcher = None
-    return jsonify({"status": "stopped"})
+        researcher_status = "STOPPED"
+    return jsonify({"status": "stopped", "state": researcher_status})
+
+@app.route('/api/restart', methods=['POST'])
+def api_restart():
+    # Helper to stop and start immediately
+    api_stop()
+    return api_start()
+
+@app.route('/api/clear', methods=['POST'])
+def api_clear():
+    global ai_logs
+    ai_logs.clear()
+    ai_logs.append("[System]: Terminal Log Cleared.")
+    return jsonify({"status": "cleared"})
+
+@app.route('/api/status', methods=['GET'])
+@app.route('/status', methods=['GET'])
+def api_status():
+    global active_researcher, researcher_status
+    if active_researcher is not None:
+        poll_val = active_researcher.poll()
+        if poll_val is not None:
+            # Only reset to STOPPED if it actually died, but KEEP the status if it's supposed to be STOPPED anyway
+            active_researcher = None
+            researcher_status = "STOPPED"
+    return jsonify({"state": researcher_status})
 
 @app.route('/viewer')
 def viewer():
@@ -255,46 +479,101 @@ def viewer():
         <img src="/video_feed" alt="MJPEG Stream">
     </div>
     <div class="panel right-panel">
-        <h1>Autonomous Reasoning Matrix</h1>
+        <h1 style="display: flex; justify-content: center; align-items: center; gap: 10px;">
+            <div id="statusLed" style="width: 12px; height: 12px; background: #555; border-radius: 50%; box-shadow: 0 0 5px rgba(0,0,0,0.5);"></div>
+            Autonomous Reasoning Matrix
+        </h1>
         
         <div class="controls">
-            <select id="modelSelect"></select>
-            <input type="text" id="topicInput" placeholder="Enter research subject (leave blank for Auto-Curiosity)...">
-            <button class="btn btn-start" onclick="startResearcher()">Initialize</button>
-            <button class="btn btn-stop" onclick="stopResearcher()">Halt</button>
+            <select id="modelSelect" title="Select LLM Engine"></select>
+            <input type="text" id="topicInput" placeholder="Enter research subject...">
+            <div style="display: flex; gap: 8px;">
+                <button id="mainBtn" class="btn btn-start" onclick="toggleResearcher()">Initialize</button>
+                <button class="btn btn-stop" onclick="stopResearcher()" style="background: #e74c3c;">Stop</button>
+                <button class="btn" onclick="restartResearcher()" style="background: #3498db; color: #fff;">Restart</button>
+                <button class="btn" onclick="clearLogs()" style="background: #7f8c8d; color: #fff;">Clear</button>
+            </div>
         </div>
         
         <div id="terminal"></div>
     </div>
     <script>
         const terminal = document.getElementById('terminal');
+        const mainBtn = document.getElementById('mainBtn');
+        const statusLed = document.getElementById('statusLed');
         let lastLogCount = 0;
+        let currentState = "STOPPED";
         
+        function updateUI(state) {
+            currentState = state;
+            if (state === "RUNNING") {
+                mainBtn.innerHTML = "Pause";
+                mainBtn.style.background = "#f39c12"; 
+                statusLed.style.background = "#00ffcc";
+                statusLed.style.boxShadow = "0 0 10px #00ffcc";
+            } else if (state === "PAUSED") {
+                mainBtn.innerHTML = "Resume";
+                mainBtn.style.background = "#00ffcc";
+                statusLed.style.background = "#f39c12";
+                statusLed.style.boxShadow = "0 0 10px #f39c12";
+            } else {
+                mainBtn.innerHTML = "Initialize";
+                mainBtn.style.background = "#00ffcc";
+                mainBtn.style.color = "#000";
+                statusLed.style.background = "#555";
+                statusLed.style.boxShadow = "none";
+            }
+        }
+
         fetch('/api/models').then(r => r.json()).then(models => {
             const sel = document.getElementById('modelSelect');
             models.forEach(m => {
                 let opt = document.createElement('option'); opt.value = m; opt.innerHTML = m; sel.appendChild(opt);
             });
         });
-        
-        function startResearcher() {
-            const model = document.getElementById('modelSelect').value;
-            const topic = document.getElementById('topicInput').value;
-            fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model, topic})});
+
+        function toggleResearcher() {
+            if (currentState === "STOPPED") {
+                updateUI("RUNNING"); // Optimistic UI update
+                const model = document.getElementById('modelSelect').value;
+                const topic = document.getElementById('topicInput').value;
+                fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model, topic})})
+                    .then(r => r.json()).then(d => updateUI(d.state));
+            } else if (currentState === "RUNNING") {
+                fetch('/api/pause', { method: 'POST' }).then(r => r.json()).then(d => updateUI(d.state));
+            } else if (currentState === "PAUSED") {
+                fetch('/api/resume', { method: 'POST' }).then(r => r.json()).then(d => updateUI(d.state));
+            }
         }
         
         function stopResearcher() {
-            fetch('/api/stop', { method: 'POST' });
+            fetch('/api/stop', { method: 'POST' }).then(r => r.json()).then(d => updateUI(d.state));
+        }
+
+        function restartResearcher() {
+            updateUI("RUNNING");
+            const model = document.getElementById('modelSelect').value;
+            const topic = document.getElementById('topicInput').value;
+            fetch('/api/restart', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model, topic})})
+                .then(r => r.json()).then(d => updateUI(d.state));
+        }
+
+        function clearLogs() {
+            fetch('/api/clear', { method: 'POST' });
         }
         
         setInterval(() => {
+            fetch('/api/status').then(r => r.json()).then(d => {
+                if (d.state !== currentState) updateUI(d.state);
+            });
+
             fetch('/logs').then(r => r.json()).then(logs => {
                 if (logs.length !== lastLogCount) {
                     terminal.innerHTML = '';
                     logs.forEach(log => {
                         const div = document.createElement('div');
                         div.className = 'log-entry';
-                        if (log.includes('[Research') || log.includes('[Curiosity') || log.includes('[Iteration') || log.includes('Initiating')) div.className += ' system-log';
+                        if (log.includes('[Research') || log.includes('[Curiosity') || log.includes('[Iteration') || log.includes('Initiating') || log.includes('[System]')) div.className += ' system-log';
                         else if (log.includes('[Executing Native Tool]')) div.className += ' tool-log';
                         else if (log.includes('Physicist:')) { 
                             div.className += ' ai-log'; 
@@ -326,9 +605,23 @@ def log_message():
 def get_logs():
     return jsonify(ai_logs)
 
+def cleanup():
+    global active_researcher
+    if active_researcher is not None:
+        try:
+            os.killpg(os.getpgid(active_researcher.pid), signal.SIGKILL)
+        except:
+            pass
+
+atexit.register(cleanup)
+
 if __name__ == "__main__":
-    t = threading.Thread(target=physics_loop, daemon=True)
-    t.start()
-    print("MuJoCo Real-Time Thread-Safe Engine Running on Port 5050...")
-    print("Open http://localhost:5050/viewer in your browser to watch the physics LIVE!")
+    # Start separate physics and rendering threads
+    p_thread = threading.Thread(target=physics_loop, daemon=True)
+    r_thread = threading.Thread(target=rendering_loop, daemon=True)
+    p_thread.start()
+    r_thread.start()
+    
+    print("MuJoCo DECOUPLED Engine Running (GPU Accel: EGL)...")
+    print("Open http://localhost:5050/viewer in your browser.")
     app.run(host="0.0.0.0", port=5050, threaded=True)
