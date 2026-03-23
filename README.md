@@ -12,14 +12,25 @@ The system is decoupled into two primary components to allow the 3D physics engi
 
 ## Dependencies & Installation
 
-### 1. Python Environment
-Install the core Python dependencies (Flask, MuJoCo, Pillow for MJPEG streaming, and mathematical arrays):
+### 1. OS-Level Prerequisites
+To natively compile the AI's published `.tex` papers into PDFs, and to run the local LLM inference engine, you must install `texlive` and the `ollama` daemon:
+```bash
+# Install LaTeX for PDF generation
+sudo apt update
+sudo apt install texlive-latex-base texlive-fonts-recommended texlive-latex-extra
+
+# Install Ollama (Local LLM Engine)
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+### 2. Python Environment
+Install the core Python dependencies (Flask for the HUD, MuJoCo for 3D physics, Pillow for MJPEG streaming, and mathematical arrays for the Agent's reasoning):
 ```bash
 pip install flask mujoco Pillow requests sympy scipy numpy
 ```
 
-### 2. Local LLM (Ollama)
-The system relies on a local LLM to run the autonomous reasoning loop without hitting API rate limits. Ensure you have Ollama installed and running.
+### 3. Local LLM (Ollama)
+The system relies on a local LLM to run the autonomous reasoning loop without hitting API rate limits. Ensure the Ollama daemon is running and pull the model:
 ```bash
 ollama serve
 ollama pull nemotron-3-super:cloud
