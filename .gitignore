@@ -1,0 +1,14 @@
+# Ignore AI experimental output and backups
+results_backup/
+MUJOCO_LOG.TXT
+*.log
+*.png
+*.gif
+*.tex
+
+# Ignore python caches
+__pycache__/
+*.pyc
+
+# Ignore testing script
+elastic_demo_3d.py
