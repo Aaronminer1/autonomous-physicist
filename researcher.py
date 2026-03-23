@@ -26,8 +26,11 @@ def broadcast(*args, **kwargs):
         pass
 print = broadcast
 
+import argparse
+
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
-MODEL = "nemotron-3-super:cloud"
+# MODEL is now dynamically overridden by argparse locally
+GLOBAL_MODEL = "nemotron-3-super:cloud"
 
 SYSTEM_PROMPT = """
 You are an autonomous AI theoretical physicist. You MUST STRICTLY follow the Scientific Method sequentially:
@@ -51,7 +54,7 @@ followed by a brief summary of what you discovered.
 
 def chat_with_llm(messages, arxiv_uses=0):
     payload = {
-        "model": MODEL,
+        "model": GLOBAL_MODEL,
         "messages": messages,
         "stream": False,
         "options": {"temperature": 0.1},
@@ -297,7 +300,7 @@ def curiosity_engine():
             ]
             
             payload = {
-                "model": MODEL,
+                "model": GLOBAL_MODEL,
                 "messages": messages,
                 "stream": False
             }
@@ -328,8 +331,15 @@ def curiosity_engine():
             time.sleep(10)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        topic = " ".join(sys.argv[1:])
-        run_research_loop(topic)
+    parser = argparse.ArgumentParser(description="Autonomous AI Physicist")
+    parser.add_argument("--model", type=str, default="nemotron-3-super:cloud", help="Ollama model name to use")
+    parser.add_argument("--topic", type=str, default="", help="Specific research topic. Leave blank for endless curiosity.")
+    args = parser.parse_args()
+    
+    GLOBAL_MODEL = args.model
+    
+    if args.topic:
+        run_research_loop(args.topic)
     else:
         curiosity_engine()
+

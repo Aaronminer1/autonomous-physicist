@@ -13,6 +13,7 @@ latest_frame = None
 lock = threading.Lock()
 condition = threading.Condition()
 ai_logs = []
+active_researcher = None
 
 default_xml = """<mujoco>
   <compiler angle="degree"/>
@@ -166,6 +167,52 @@ def generate_frames():
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/api/models', methods=['GET'])
+def api_models():
+    try:
+        import urllib.request, json
+        req = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+        data = json.loads(req.read())
+        models = [m["name"] for m in data.get("models", [])]
+        return jsonify(models)
+    except Exception as e:
+        return jsonify(["nemotron-3-super:cloud", "llama3.2:latest"])
+
+@app.route('/api/start', methods=['POST'])
+def api_start():
+    global active_researcher, ai_logs
+    import subprocess
+    
+    data = request.json
+    model = data.get("model", "nemotron-3-super:cloud")
+    topic = data.get("topic", "").strip()
+
+    if active_researcher is not None:
+        try:
+            active_researcher.terminate()
+            active_researcher.wait(timeout=2)
+        except:
+            pass
+
+    ai_logs.clear()
+    cmd = ["python3", "-u", "researcher.py", "--model", model]
+    if topic:
+        cmd.extend(["--topic", topic])
+        
+    active_researcher = subprocess.Popen(cmd)
+    return jsonify({"status": "started"})
+    
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    global active_researcher
+    if active_researcher is not None:
+        try:
+            active_researcher.terminate()
+        except:
+            pass
+        active_researcher = None
+    return jsonify({"status": "stopped"})
+
 @app.route('/viewer')
 def viewer():
     html = """<!DOCTYPE html>
@@ -180,7 +227,18 @@ def viewer():
         img { max-width: 100%; border-radius: 8px; border: 1px solid #00ffcc; margin-top: auto; margin-bottom: auto;}
         h1 { font-size: 1.5rem; margin-top: 0; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px rgba(0,255,204,0.5); margin-bottom: 15px; text-align: center; }
         #terminal { flex: 1; background: #000; font-family: 'Fira Code', 'Courier New', monospace; font-size: 0.9rem; padding: 15px; overflow-y: auto; border-radius: 8px; border: 1px solid #333; color: #eee; white-space: pre-wrap; line-height: 1.5; }
-        .log-entry { margin-bottom: 8px; }
+        
+        .controls { display: flex; gap: 10px; margin-bottom: 15px; width: 100%; }
+        .controls select, .controls input { background: #1a1a24; color: #fff; border: 1px solid #333; padding: 10px; border-radius: 6px; font-family: 'Inter'; outline: none; }
+        .controls select:focus, .controls input:focus { border-color: #00ffcc; }
+        .controls input { flex: 1; }
+        .btn { padding: 10px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: all 0.2s ease; text-transform: uppercase; letter-spacing: 1px; }
+        .btn-start { background: #00ffcc; color: #000; }
+        .btn-start:hover { background: #00e6b8; box-shadow: 0 0 15px rgba(0,255,204,0.4); }
+        .btn-stop { background: #e74c3c; color: #fff; }
+        .btn-stop:hover { background: #c0392b; box-shadow: 0 0 15px rgba(231,76,60,0.4); }
+        
+        .log-entry { margin-bottom: 8px; line-height: 1.4; }
         .system-log { color: #f39c12; font-weight: bold; }
         .tool-log { color: #e74c3c; font-weight: bold; }
         .ai-log { color: #bdc3c7; }
@@ -198,11 +256,37 @@ def viewer():
     </div>
     <div class="panel right-panel">
         <h1>Autonomous Reasoning Matrix</h1>
+        
+        <div class="controls">
+            <select id="modelSelect"></select>
+            <input type="text" id="topicInput" placeholder="Enter research subject (leave blank for Auto-Curiosity)...">
+            <button class="btn btn-start" onclick="startResearcher()">Initialize</button>
+            <button class="btn btn-stop" onclick="stopResearcher()">Halt</button>
+        </div>
+        
         <div id="terminal"></div>
     </div>
     <script>
         const terminal = document.getElementById('terminal');
         let lastLogCount = 0;
+        
+        fetch('/api/models').then(r => r.json()).then(models => {
+            const sel = document.getElementById('modelSelect');
+            models.forEach(m => {
+                let opt = document.createElement('option'); opt.value = m; opt.innerHTML = m; sel.appendChild(opt);
+            });
+        });
+        
+        function startResearcher() {
+            const model = document.getElementById('modelSelect').value;
+            const topic = document.getElementById('topicInput').value;
+            fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model, topic})});
+        }
+        
+        function stopResearcher() {
+            fetch('/api/stop', { method: 'POST' });
+        }
+        
         setInterval(() => {
             fetch('/logs').then(r => r.json()).then(logs => {
                 if (logs.length !== lastLogCount) {
@@ -210,7 +294,7 @@ def viewer():
                     logs.forEach(log => {
                         const div = document.createElement('div');
                         div.className = 'log-entry';
-                        if (log.includes('[Research') || log.includes('[Curiosity') || log.includes('[Iteration')) div.className += ' system-log';
+                        if (log.includes('[Research') || log.includes('[Curiosity') || log.includes('[Iteration') || log.includes('Initiating')) div.className += ' system-log';
                         else if (log.includes('[Executing Native Tool]')) div.className += ' tool-log';
                         else if (log.includes('Physicist:')) { 
                             div.className += ' ai-log'; 
